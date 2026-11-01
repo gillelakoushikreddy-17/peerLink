@@ -924,38 +924,57 @@ def run_cli():
             print("\nExiting.")
             sys.exit(0)
 
-    # 2. Server host/IP resolution: CLI argument > environment variable > interactive prompt
+    # 2. Server host and port resolution
     server_ip = config.signaling_server_ip
+    server_port = config.server_port
+
     if len(sys.argv) > 2:
-        try:
-            server_ip = validate_host(sys.argv[2], "Signaling Server Host")
-        except ValueError as e:
-            print(f"Warning: {e}. Falling back to configured host: {server_ip}")
+        raw_target = sys.argv[2].strip()
+        if ":" in raw_target:
+            h, p = raw_target.rsplit(":", 1)
+            try:
+                server_ip = validate_host(h, "Signaling Server Host")
+                server_port = validate_port(p, "Signaling Server Port")
+            except ValueError as e:
+                print(f"Warning: {e}. Using {server_ip}:{server_port}")
+        else:
+            try:
+                server_ip = validate_host(raw_target, "Signaling Server Host")
+            except ValueError as e:
+                print(f"Warning: {e}. Falling back to configured host: {server_ip}")
     elif "SIGNALING_SERVER_IP" not in os.environ:
         try:
             prompt_str = f"Enter signaling server host/IP [{server_ip}]: "
             val = input(prompt_str).strip()
             if val:
-                try:
-                    server_ip = validate_host(val, "Signaling Server Host")
-                except ValueError as e:
-                    print(f"Warning: {e}. Using {server_ip}")
+                if ":" in val:
+                    h, p = val.rsplit(":", 1)
+                    try:
+                        server_ip = validate_host(h, "Signaling Server Host")
+                        server_port = validate_port(p, "Signaling Server Port")
+                    except ValueError as e:
+                        print(f"Warning: {e}. Using {server_ip}:{server_port}")
+                else:
+                    try:
+                        server_ip = validate_host(val, "Signaling Server Host")
+                    except ValueError as e:
+                        print(f"Warning: {e}. Using {server_ip}")
         except (KeyboardInterrupt, EOFError):
             print("\nExiting.")
             sys.exit(0)
 
-    # 3. Optional listen port (retained for command compatibility)
+    # 3. Optional signaling server port argument (e.g. python client.py alice 127.0.0.1 5050)
     listen_port = config.client_listen_port
     if len(sys.argv) > 3:
         try:
-            listen_port = validate_port(sys.argv[3], "Client Port")
+            server_port = validate_port(sys.argv[3], "Signaling Server Port")
         except ValueError as e:
-            print(f"Warning: {e}. Using {listen_port}")
+            print(f"Warning: {e}. Using {server_port}")
 
     client = PeerClient(
         username=username,
         signaling_ip=server_ip,
-        signaling_port=config.server_port,
+        signaling_port=server_port,
         listen_host=config.client_listen_host,
         listen_port=listen_port,
         stun_server_url=config.stun_server_url,

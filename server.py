@@ -48,7 +48,7 @@ class SignalingServer:
     Coordinates peer registration and connection requests only.
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 5000):
+    def __init__(self, host: str = "0.0.0.0", port: int = 5050):
         self.host = host
         self.port = port
         self.server_sock: Optional[socket.socket] = None

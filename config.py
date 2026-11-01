@@ -174,7 +174,7 @@ class AppConfig:
 
         # Signaling server configuration
         self.server_host = validate_ip(os.getenv("SERVER_HOST", "0.0.0.0"), "SERVER_HOST", allow_all_interfaces=True)
-        self.server_port = validate_port(os.getenv("SERVER_PORT", "5000"), "SERVER_PORT")
+        self.server_port = validate_port(os.getenv("SERVER_PORT", "5050"), "SERVER_PORT")
 
         # Client connection configuration
         # For client: signaling server IP or hostname to connect to
