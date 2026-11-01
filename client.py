@@ -1,22 +1,37 @@
 """
-client.py - Terminal-based Peer-to-Peer Chat Client.
+client.py - Terminal-based WebRTC Peer-to-Peer Chat Client.
 
-Connects to a signaling server solely for peer discovery and network-endpoint exchange.
-All chat communication is strictly direct peer-to-peer over dedicated TCP sockets.
+Connects to a signaling server solely for peer discovery and WebRTC signaling exchange.
+All chat communication is strictly direct peer-to-peer over WebRTC DataChannels using aiortc.
+Zero server-side message relay.
 """
 
 import os
 import sys
 import time
+import json
 import socket
 import logging
 import threading
-from typing import Dict, Any, Optional
+import asyncio
+from typing import Dict, Any, Optional, List
 
-from config import AppConfig, get_lan_ip, validate_ip, validate_port
+from aiortc import (
+    RTCPeerConnection,
+    RTCSessionDescription,
+    RTCConfiguration,
+    RTCIceServer,
+    RTCDataChannel,
+)
+from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
+
+from config import AppConfig, get_lan_ip, validate_ip, validate_port, validate_host, validate_stun_urls
 from protocol import (
     send_msg,
     recv_msg,
+    async_send_msg,
+    async_recv_msg,
+    MAX_MESSAGE_SIZE,
     ACTION_REGISTER,
     ACTION_REGISTER_ACK,
     ACTION_REGISTER_ERROR,
@@ -26,8 +41,9 @@ from protocol import (
     ACTION_PEER_INFO,
     ACTION_CONNECT_ERROR,
     ACTION_USER_DISCONNECTED,
-    ACTION_PEER_HANDSHAKE,
-    ACTION_PEER_HANDSHAKE_ACK,
+    ACTION_WEBRTC_OFFER,
+    ACTION_WEBRTC_ANSWER,
+    ACTION_WEBRTC_ICE,
     ACTION_CHAT_MESSAGE,
     ACTION_PEER_DISCONNECT,
 )
@@ -37,10 +53,11 @@ logger = logging.getLogger("p2p_chat.client")
 
 class PeerClient:
     """
-    P2P Chat Client that:
-    1. Listens for incoming direct TCP chat connections from other peers.
-    2. Maintains a signaling connection for online user discovery and endpoint lookup.
-    3. Establishes and manages direct, encrypted/isolated P2P TCP connections with peers.
+    WebRTC P2P Chat Client that:
+    1. Connects to the signaling server for peer discovery and SDP/ICE signaling exchange.
+    2. Establishes direct WebRTC DataChannels (using STUN for NAT traversal).
+    3. Sends and receives chat messages strictly peer-to-peer through the DataChannel.
+    4. Never relays chat messages through the signaling server.
     """
 
     def __init__(
@@ -51,6 +68,8 @@ class PeerClient:
         listen_host: str = "0.0.0.0",
         listen_port: int = 6001,
         advertised_ip: Optional[str] = None,
+        stun_server_url: Optional[str] = None,
+        stun_server_urls: Optional[List[str]] = None,
     ):
         self.username = username
         self.signaling_ip = signaling_ip
@@ -59,143 +78,120 @@ class PeerClient:
         self.listen_port = listen_port
         self.advertised_ip = advertised_ip or get_lan_ip()
 
-        # Signaling connection
-        self.signaling_sock: Optional[socket.socket] = None
+        # Parse and validate STUN server URL(s)
+        if stun_server_urls:
+            self.stun_server_urls = stun_server_urls
+        elif stun_server_url:
+            self.stun_server_urls = validate_stun_urls(stun_server_url)
+        else:
+            self.stun_server_urls = ["stun:stun.l.google.com:19302"]
+        self.stun_server_url = self.stun_server_urls[0]
+
+        # WebRTC Configuration with validated STUN servers
+        self.rtc_config = RTCConfiguration(
+            iceServers=[RTCIceServer(urls=self.stun_server_urls)]
+        )
+
+        # Signaling connection state
         self.signaling_connected = False
+        self.signaling_reader: Optional[asyncio.StreamReader] = None
+        self.signaling_writer: Optional[asyncio.StreamWriter] = None
+        self.signaling_task: Optional[asyncio.Task] = None
 
-        # Peer listener socket
-        self.listener_sock: Optional[socket.socket] = None
-        self.is_running = False
+        # Dedicated background asyncio event loop for networking
+        self.loop = asyncio.new_event_loop()
+        self.loop_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+        self.loop_thread.start()
 
-        # Active direct P2P connections: username -> {"socket": socket.socket, "ip": str, "port": int}
+        # WebRTC Peer Connections and DataChannels
+        # target_user -> RTCPeerConnection
+        self.peer_connections: Dict[str, RTCPeerConnection] = {}
+        # target_user -> RTCDataChannel
+        self.data_channels: Dict[str, RTCDataChannel] = {}
+        # target_user -> asyncio.Event (signals when DataChannel is open or errored)
+        self.channel_ready_events: Dict[str, asyncio.Event] = {}
+        # target_user -> list of early RTCIceCandidate objects buffered before remote description is set
+        self.pending_ice_candidates: Dict[str, List[Any]] = {}
+        # target_user -> error message from signaling/ICE
+        self.connection_errors: Dict[str, str] = {}
+
+        # Set of tracked background asyncio tasks to prevent premature garbage collection
+        self.background_tasks: set[asyncio.Task] = set()
+
+        # Active direct P2P connections: username -> {"channel": RTCDataChannel, "pc": RTCPeerConnection, "connected_at": float}
         self.active_peers: Dict[str, Dict[str, Any]] = {}
-        # socket -> username
-        self.sock_to_peer: Dict[socket.socket, str] = {}
         self.peers_lock = threading.Lock()
 
-        # Currently active chat partner
+        # Active chat partner
         self.active_chat_partner: Optional[str] = None
 
-        # Synchronization for signaling request/responses (e.g. list_users, connect_req)
-        self.pending_requests: Dict[str, threading.Event] = {}
+        # Synchronization for signaling requests
+        self.pending_requests: Dict[str, asyncio.Event] = {}
         self.response_data: Dict[str, Any] = {}
-        self.req_lock = threading.Lock()
 
-        # Console output lock
+        # Console print lock
         self.print_lock = threading.Lock()
+        self.is_running = True
+
+    def _create_tracked_task(self, coro) -> asyncio.Task:
+        """Create an asyncio task on the background loop with a strong reference to prevent GC."""
+        task = self.loop.create_task(coro)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        return task
+
+    def _run_async_loop(self) -> None:
+        """Run the dedicated asyncio event loop in a background thread."""
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def _run_coro(self, coro, timeout: Optional[float] = 12.0) -> Any:
+        """Execute a coroutine on the background asyncio loop and wait for result."""
+        fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return fut.result(timeout=timeout)
 
     def safe_print(self, message: str, end: str = "\n") -> None:
-        """Thread-safe terminal printing that restores the CLI prompt cleanly."""
+        """Thread-safe terminal printing that cleanly redraws the CLI prompt."""
         with self.print_lock:
-            # Overwrite current line, print message, and restore prompt if running
             sys.stdout.write(f"\r\033[K{message}{end}")
             if self.is_running:
                 prompt_partner = f" [{self.active_chat_partner}]" if self.active_chat_partner else ""
                 sys.stdout.write(f"CLI{prompt_partner} > ")
             sys.stdout.flush()
 
-    # -------------------------------------------------------------------------
-    # 1. P2P Direct Listener (Incoming Peer Connections)
-    # -------------------------------------------------------------------------
     def start_peer_listener(self) -> None:
-        """Bind TCP socket to listen for incoming direct peer connections."""
-        self.listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if sys.platform != "win32":
-            self.listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        else:
-            try:
-                self.listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            except Exception:
-                pass
-
-        try:
-            self.listener_sock.bind((self.listen_host, self.listen_port))
-            self.listener_sock.listen(10)
-        except OSError as e:
-            self.safe_print(f"[-] Could not bind P2P listener on port {self.listen_port}: {e}")
-            raise
-
+        """
+        Retained for backward compatibility. In WebRTC, peer connectivity
+        is initiated via signaling rather than an open inbound TCP listen port.
+        """
         self.is_running = True
-        t = threading.Thread(target=self._peer_accept_loop, daemon=True)
-        t.start()
-        logger.info("Direct P2P listener active on %s:%d", self.listen_host, self.listen_port)
-
-    def _peer_accept_loop(self) -> None:
-        """Accept incoming direct TCP connections from peers."""
-        while self.is_running:
-            try:
-                peer_sock, peer_addr = self.listener_sock.accept()
-                t = threading.Thread(
-                    target=self._handle_incoming_peer,
-                    args=(peer_sock, peer_addr),
-                    daemon=True,
-                )
-                t.start()
-            except OSError:
-                break
-
-    def _handle_incoming_peer(self, peer_sock: socket.socket, peer_addr: tuple) -> None:
-        """Perform handshake with incoming peer and start direct message loop."""
-        remote_user = None
-        try:
-            # First message must be peer handshake
-            msg = recv_msg(peer_sock)
-            if not msg or msg.get("type") != ACTION_PEER_HANDSHAKE:
-                peer_sock.close()
-                return
-
-            remote_user = msg.get("username")
-            if not remote_user:
-                peer_sock.close()
-                return
-
-            # Acknowledge handshake directly to peer
-            send_msg(peer_sock, {"type": ACTION_PEER_HANDSHAKE_ACK, "username": self.username})
-
-            with self.peers_lock:
-                # If an existing connection to this peer already exists, close the old one
-                if remote_user in self.active_peers:
-                    old_sock = self.active_peers[remote_user]["socket"]
-                    try:
-                        old_sock.close()
-                    except Exception:
-                        pass
-
-                self.active_peers[remote_user] = {
-                    "socket": peer_sock,
-                    "ip": peer_addr[0],
-                    "port": peer_addr[1],
-                }
-                self.sock_to_peer[peer_sock] = remote_user
-
-                if not self.active_chat_partner:
-                    self.active_chat_partner = remote_user
-
-            self.safe_print(f"\n[+] Direct P2P connection established with '{remote_user}' ({peer_addr[0]}:{peer_addr[1]})")
-            self._peer_message_loop(peer_sock, remote_user)
-
-        except Exception as e:
-            logger.debug("Error during incoming peer handshake with %s: %s", remote_user or peer_addr, e)
-            self._cleanup_peer(peer_sock, remote_user)
+        logger.info("WebRTC P2P listener active (using STUN: %s)", self.stun_server_url)
 
     # -------------------------------------------------------------------------
-    # 2. Signaling Server Connection & Discovery
+    # Signaling Server Connection & Discovery
     # -------------------------------------------------------------------------
     def connect_to_signaling_server(self) -> bool:
         """Establish connection to signaling server and register this client."""
         try:
-            self.signaling_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.signaling_sock.settimeout(5.0)
-            self.signaling_sock.connect((self.signaling_ip, self.signaling_port))
-            self.signaling_sock.settimeout(None)
-            self.signaling_connected = True
-        except (socket.error, OSError) as e:
+            return self._run_coro(self._async_connect_to_signaling_server(), timeout=8.0)
+        except Exception as e:
             self.safe_print(f"[-] Could not connect to signaling server at {self.signaling_ip}:{self.signaling_port}: {e}")
-            if self.signaling_sock:
-                self.signaling_sock.close()
+            self.signaling_connected = False
             return False
 
-        # Register username and listening port
+    async def _async_connect_to_signaling_server(self) -> bool:
+        """Async implementation of signaling server connection and registration."""
+        try:
+            self.signaling_reader, self.signaling_writer = await asyncio.wait_for(
+                asyncio.open_connection(self.signaling_ip, self.signaling_port),
+                timeout=5.0,
+            )
+            self.signaling_connected = True
+        except Exception as e:
+            logger.debug("Failed to connect to signaling server: %s", e)
+            return False
+
+        # Register username on signaling server
         reg_payload = {
             "type": ACTION_REGISTER,
             "username": self.username,
@@ -203,82 +199,107 @@ class PeerClient:
             "advertised_ip": self.advertised_ip,
         }
         try:
-            send_msg(self.signaling_sock, reg_payload)
-            resp = recv_msg(self.signaling_sock)
+            await async_send_msg(self.signaling_writer, reg_payload)
+            resp = await asyncio.wait_for(async_recv_msg(self.signaling_reader), timeout=5.0)
+
             if not resp or resp.get("type") != ACTION_REGISTER_ACK:
                 err = resp.get("error") if resp else "No response from signaling server."
                 self.safe_print(f"[-] Registration failed: {err}")
-                self.signaling_sock.close()
                 self.signaling_connected = False
                 return False
 
-            self.safe_print(f"[+] Registered as '{self.username}' on signaling server ({self.signaling_ip}:{self.signaling_port})")
-            # Start background thread to listen for signaling server updates
-            t = threading.Thread(target=self._signaling_listen_loop, daemon=True)
-            t.start()
+            self.safe_print(
+                f"[+] Registered as '{self.username}' on signaling server ({self.signaling_ip}:{self.signaling_port})"
+            )
+            # Start background signaling reader task
+            self.signaling_task = asyncio.create_task(self._signaling_listen_loop())
             return True
 
         except Exception as e:
             self.safe_print(f"[-] Error during signaling registration: {e}")
-            if self.signaling_sock:
-                self.signaling_sock.close()
             self.signaling_connected = False
             return False
 
-    def _signaling_listen_loop(self) -> None:
-        """Listen for discovery updates and incoming connection notifications from signaling server."""
+    async def _send_signaling(self, msg: Dict[str, Any]) -> bool:
+        """Send a message to the signaling server."""
+        if not self.signaling_connected or not self.signaling_writer:
+            return False
+        try:
+            await async_send_msg(self.signaling_writer, msg)
+            return True
+        except Exception as e:
+            logger.debug("Failed to send signaling message: %s", e)
+            return False
+
+    async def _signaling_listen_loop(self) -> None:
+        """Continuous background loop processing incoming signaling messages."""
         while self.is_running and self.signaling_connected:
             try:
-                msg = recv_msg(self.signaling_sock)
+                msg = await async_recv_msg(self.signaling_reader)
                 if msg is None:
-                    # Server closed signaling connection
                     break
 
                 action = msg.get("type")
 
                 if action == ACTION_USER_LIST:
-                    with self.req_lock:
-                        self.response_data[ACTION_USER_LIST] = msg.get("users", [])
-                        if ACTION_USER_LIST in self.pending_requests:
-                            self.pending_requests[ACTION_USER_LIST].set()
+                    self.response_data[ACTION_USER_LIST] = msg.get("users", [])
+                    if ACTION_USER_LIST in self.pending_requests:
+                        self.pending_requests[ACTION_USER_LIST].set()
+
+                elif action == ACTION_CONNECT_ERROR:
+                    self.response_data[ACTION_CONNECT_ERROR] = msg
+                    if ACTION_CONNECT_REQ in self.pending_requests:
+                        self.pending_requests[ACTION_CONNECT_REQ].set()
+                    # Also print error if related to a direct signaling attempt
+                    err = msg.get("error", "Unknown signaling error")
+                    target = msg.get("target_user")
+                    if target:
+                        self.connection_errors[target] = err
+                        if target in self.channel_ready_events:
+                            self.channel_ready_events[target].set()
+                        self.safe_print(f"[-] Signaling notice regarding '{target}': {err}")
 
                 elif action == ACTION_PEER_INFO:
                     direction = msg.get("direction")
                     if direction == "incoming_notice":
                         peer_name = msg.get("peer_user")
-                        self.safe_print(f"[*] Peer '{peer_name}' is attempting to connect directly to you...")
+                        self.safe_print(f"[*] Peer '{peer_name}' is requesting a direct chat...")
                     else:
-                        with self.req_lock:
-                            self.response_data[ACTION_PEER_INFO] = msg
-                            if ACTION_PEER_INFO in self.pending_requests:
-                                self.pending_requests[ACTION_PEER_INFO].set()
-
-                elif action == ACTION_CONNECT_ERROR:
-                    with self.req_lock:
-                        self.response_data[ACTION_CONNECT_ERROR] = msg
-                        if ACTION_CONNECT_REQ in self.pending_requests:
-                            self.pending_requests[ACTION_CONNECT_REQ].set()
+                        self.response_data[ACTION_PEER_INFO] = msg
+                        if ACTION_PEER_INFO in self.pending_requests:
+                            self.pending_requests[ACTION_PEER_INFO].set()
 
                 elif action == ACTION_USER_DISCONNECTED:
                     left_user = msg.get("username")
                     self.safe_print(f"[*] Signaling Notice: User '{left_user}' has gone offline.")
 
+                elif action == ACTION_WEBRTC_OFFER:
+                    # Incoming WebRTC offer from a peer
+                    self._create_tracked_task(self._handle_incoming_webrtc_offer(msg))
+
+                elif action == ACTION_WEBRTC_ANSWER:
+                    # Incoming WebRTC answer from a peer
+                    self._create_tracked_task(self._handle_incoming_webrtc_answer(msg))
+
+                elif action == ACTION_WEBRTC_ICE:
+                    # Incoming WebRTC ICE candidate from a peer
+                    self._create_tracked_task(self._handle_incoming_webrtc_ice(msg))
+
+            except (ConnectionResetError, ConnectionAbortedError, asyncio.IncompleteReadError):
+                break
             except Exception as e:
-                logger.debug("Signaling listen error: %s", e)
+                logger.debug("Signaling listen loop exception: %s", e)
                 break
 
         self.signaling_connected = False
         if self.is_running:
-            self.safe_print("\n[!] Connection to signaling server lost. Direct P2P chats remain active.")
+            self.safe_print("\n[!] Connection to signaling server lost. Direct WebRTC P2P chats remain active.")
 
     # -------------------------------------------------------------------------
-    # 3. Direct Peer-to-Peer Connection Outbound
+    # WebRTC Peer Connection Establishment & Handshake
     # -------------------------------------------------------------------------
     def connect_to_peer(self, target_username: str) -> bool:
-        """
-        Look up target peer via signaling server, establish direct TCP connection,
-        perform peer handshake, and start direct message loop.
-        """
+        """Synchronous wrapper to initiate a direct WebRTC connection to a target peer."""
         if target_username == self.username:
             self.safe_print("[-] You cannot chat with yourself.")
             return False
@@ -290,156 +311,402 @@ class PeerClient:
                 return True
 
         if not self.signaling_connected:
-            self.safe_print("[-] Signaling server unavailable. Cannot discover peer network endpoint.")
+            self.safe_print("[-] Signaling server unavailable. Cannot initiate WebRTC handshake.")
             return False
 
-        self.safe_print(f"[*] Discovering network endpoint for '{target_username}' from signaling server...")
-
-        # Request peer connection info from signaling server
-        req_event = threading.Event()
-        with self.req_lock:
-            self.pending_requests[ACTION_PEER_INFO] = req_event
-            self.pending_requests[ACTION_CONNECT_REQ] = req_event
-            self.response_data.pop(ACTION_PEER_INFO, None)
-            self.response_data.pop(ACTION_CONNECT_ERROR, None)
-
         try:
-            send_msg(self.signaling_sock, {"type": ACTION_CONNECT_REQ, "target_user": target_username})
+            return self._run_coro(self._async_connect_to_peer(target_username), timeout=15.0)
         except Exception as e:
-            self.safe_print(f"[-] Failed to send connect request to signaling server: {e}")
+            self.safe_print(f"[-] Connection attempt to '{target_username}' encountered an error: {e}")
             return False
 
-        # Wait for signaling server response (timeout 5s)
-        if not req_event.wait(timeout=5.0):
-            self.safe_print("[-] Connection request timed out waiting for signaling server.")
-            return False
+    async def _async_connect_to_peer(self, target_username: str) -> bool:
+        """Establish direct WebRTC peer connection via SDP offer and candidate exchange."""
+        self.safe_print(f"[*] Initiating direct WebRTC P2P connection to '{target_username}'...")
 
-        with self.req_lock:
-            err_info = self.response_data.get(ACTION_CONNECT_ERROR)
-            peer_info = self.response_data.get(ACTION_PEER_INFO)
+        # If a previous connection attempt is hanging or closed, clean it up first
+        await self._async_cleanup_peer(target_username)
+        self.connection_errors.pop(target_username, None)
 
-        if err_info:
-            self.safe_print(f"[-] Could not connect to '{target_username}': {err_info.get('error')}")
-            return False
+        # 1. Create RTCPeerConnection with STUN server configuration
+        pc = RTCPeerConnection(configuration=self.rtc_config)
+        self.peer_connections[target_username] = pc
 
-        if not peer_info:
-            self.safe_print(f"[-] No connection information received for '{target_username}'.")
-            return False
+        ready_event = asyncio.Event()
+        self.channel_ready_events[target_username] = ready_event
 
-        peer_ip = peer_info.get("peer_ip")
-        peer_port = peer_info.get("peer_port")
+        # 2. Create the DataChannel for chat messaging
+        channel = pc.createDataChannel("chat")
+        self.data_channels[target_username] = channel
+        self._setup_datachannel(channel, target_username)
+        self._setup_pc_events(pc, target_username)
 
-        self.safe_print(f"[*] Establishing direct TCP connection to {peer_ip}:{peer_port}...")
-
-        # Create direct peer socket
-        peer_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        peer_sock.settimeout(6.0)
+        # 3. Create offer and set local description
         try:
-            peer_sock.connect((peer_ip, peer_port))
-            peer_sock.settimeout(None)
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+        except Exception as e:
+            self.safe_print(f"[-] Failed to generate WebRTC offer: {e}")
+            await self._async_cleanup_peer(target_username)
+            return False
 
-            # Transmit direct peer handshake
-            send_msg(peer_sock, {"type": ACTION_PEER_HANDSHAKE, "username": self.username})
-            ack = recv_msg(peer_sock)
+        # 4. Transmit offer via signaling server to peer
+        sent = await self._send_signaling(
+            {
+                "type": ACTION_WEBRTC_OFFER,
+                "target_user": target_username,
+                "sdp": pc.localDescription.sdp,
+                "type_name": pc.localDescription.type,
+            }
+        )
+        if not sent:
+            self.safe_print("[-] Failed to send WebRTC offer via signaling server.")
+            await self._async_cleanup_peer(target_username)
+            return False
 
-            if not ack or ack.get("type") != ACTION_PEER_HANDSHAKE_ACK:
-                self.safe_print("[-] Peer handshake failed.")
-                peer_sock.close()
-                return False
+        # 5. Extract and trickle gathered ICE candidates from local SDP
+        await self._send_local_ice_candidates(pc, target_username)
 
-            with self.peers_lock:
-                self.active_peers[target_username] = {
-                    "socket": peer_sock,
-                    "ip": peer_ip,
-                    "port": peer_port,
-                }
-                self.sock_to_peer[peer_sock] = target_username
-                self.active_chat_partner = target_username
-
-            self.safe_print(f"[+] Direct P2P connection to '{target_username}' established! (Active chat set to '{target_username}')")
-
-            # Start message receiving thread for this peer
-            t = threading.Thread(
-                target=self._peer_message_loop,
-                args=(peer_sock, target_username),
-                daemon=True,
-            )
-            t.start()
-            return True
-
-        except (socket.error, OSError) as e:
+        # 6. Wait for DataChannel to reach 'open' state (10s timeout)
+        self.safe_print(f"[*] Waiting for direct P2P connectivity checks with '{target_username}'...")
+        try:
+            await asyncio.wait_for(ready_event.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
             self.safe_print(
-                f"[-] Direct connection to {peer_ip}:{peer_port} failed: {e}\n"
-                f"    (Ensure both devices are on the same Wi-Fi and port {peer_port} is not blocked by Windows Firewall)"
+                f"\n[-] Direct WebRTC connection to '{target_username}' timed out.\n"
+                f"    Reason: Could not establish a direct peer-to-peer path within 10 seconds.\n"
+                f"    Possible Causes:\n"
+                f"    1. Restrictive firewalls or symmetric NATs blocking direct UDP traversal.\n"
+                f"    2. Peer '{target_username}' did not respond or is unreachable.\n"
+                f"    Note: By design, chat messages are NEVER relayed through the signaling server.\n"
+                f"    Troubleshooting:\n"
+                f"    - Verify both devices allow outbound UDP on standard ports.\n"
+                f"    - If on restrictive corporate/guest Wi-Fi with client isolation, test using standard networks or mobile hotspots."
             )
-            peer_sock.close()
+            await self._async_cleanup_peer(target_username)
             return False
 
-    def _peer_message_loop(self, peer_sock: socket.socket, peer_user: str) -> None:
-        """Receive chat messages directly from the peer over the peer TCP socket."""
-        try:
-            while self.is_running:
-                msg = recv_msg(peer_sock)
-                if msg is None:
-                    # Peer closed direct connection
-                    break
+        # Check if signaling server or ICE reported an immediate failure
+        if target_username in self.connection_errors:
+            err = self.connection_errors.pop(target_username)
+            self.safe_print(f"[-] Could not connect to '{target_username}': {err}")
+            await self._async_cleanup_peer(target_username)
+            return False
 
-                action = msg.get("type")
-                if action == ACTION_CHAT_MESSAGE:
-                    sender = msg.get("from", peer_user)
-                    text = msg.get("text", "")
-                    timestamp = time.strftime("%H:%M:%S", time.localtime(msg.get("timestamp", time.time())))
-                    # Display message directly
-                    self.safe_print(f"\n[{timestamp}] [{sender}]: {text}")
+        if channel.readyState != "open":
+            self.safe_print(f"[-] DataChannel failed to open (state: {channel.readyState}).")
+            await self._async_cleanup_peer(target_username)
+            return False
 
-                elif action == ACTION_PEER_DISCONNECT:
-                    self.safe_print(f"\n[*] Peer '{peer_user}' closed the direct chat session.")
-                    break
-
-        except (ConnectionResetError, ConnectionAbortedError):
-            pass
-        except Exception as e:
-            logger.debug("Peer message loop error for %s: %s", peer_user, e)
-        finally:
-            self._cleanup_peer(peer_sock, peer_user)
-
-    def _cleanup_peer(self, peer_sock: socket.socket, peer_user: Optional[str]) -> None:
-        """Close socket and clean up active peer record."""
-        target_name = peer_user
         with self.peers_lock:
-            if not target_name:
-                target_name = self.sock_to_peer.get(peer_sock)
-            if target_name and target_name in self.active_peers:
-                del self.active_peers[target_name]
-            if peer_sock in self.sock_to_peer:
-                del self.sock_to_peer[peer_sock]
+            self.active_chat_partner = target_username
 
-            if self.active_chat_partner == target_name:
-                # Switch active chat partner to another connected peer if any, otherwise None
+        return True
+
+    async def _handle_incoming_webrtc_offer(self, msg: Dict[str, Any]) -> None:
+        """Handle incoming WebRTC offer from a remote peer."""
+        sender = msg.get("sender")
+        sdp = msg.get("sdp")
+        type_name = msg.get("type_name", "offer")
+
+        if not sender or not sdp:
+            return
+
+        # Check for glare (simultaneous outbound connection attempt)
+        existing_pc = self.peer_connections.get(sender)
+        if existing_pc and existing_pc.signalingState == "have-local-offer":
+            # Polite / impolite tie-breaking: lower username yields
+            if self.username < sender:
+                # We yield to remote offer
+                logger.debug("Glare resolution: yielding to remote offer from '%s'", sender)
+                await self._async_cleanup_peer(sender)
+            else:
+                # Impolite: ignore remote offer and let remote peer accept ours
+                logger.debug("Glare resolution: ignoring remote offer from '%s'", sender)
+                return
+        elif sender in self.active_peers:
+            logger.debug("Ignoring duplicate offer from already connected peer '%s'", sender)
+            return
+
+        self.safe_print(f"\n[*] Received direct WebRTC chat request from '{sender}'. Connecting...")
+
+        pc = RTCPeerConnection(configuration=self.rtc_config)
+        self.peer_connections[sender] = pc
+
+        ready_event = asyncio.Event()
+        self.channel_ready_events[sender] = ready_event
+        self._setup_pc_events(pc, sender)
+
+        @pc.on("datachannel")
+        def on_datachannel(channel: RTCDataChannel):
+            logger.debug("Received inbound DataChannel from '%s'", sender)
+            self.data_channels[sender] = channel
+            self._setup_datachannel(channel, sender)
+
+        try:
+            remote_desc = RTCSessionDescription(sdp=sdp, type=type_name)
+            await pc.setRemoteDescription(remote_desc)
+
+            # Drain any early ICE candidates that arrived before remote description
+            if sender in self.pending_ice_candidates:
+                for cand in self.pending_ice_candidates[sender]:
+                    try:
+                        await pc.addIceCandidate(cand)
+                    except Exception as e:
+                        logger.debug("Error applying early candidate: %s", e)
+                del self.pending_ice_candidates[sender]
+
+            # Generate answer and set local description
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+
+            # Send answer to signaling server
+            await self._send_signaling(
+                {
+                    "type": ACTION_WEBRTC_ANSWER,
+                    "target_user": sender,
+                    "sdp": pc.localDescription.sdp,
+                    "type_name": pc.localDescription.type,
+                }
+            )
+
+            # Send local ICE candidates to peer
+            await self._send_local_ice_candidates(pc, sender)
+
+        except Exception as e:
+            self.safe_print(f"[-] Failed to process WebRTC offer from '{sender}': {e}")
+            await self._async_cleanup_peer(sender)
+
+    async def _handle_incoming_webrtc_answer(self, msg: Dict[str, Any]) -> None:
+        """Handle incoming WebRTC answer from remote peer."""
+        sender = msg.get("sender")
+        sdp = msg.get("sdp")
+        type_name = msg.get("type_name", "answer")
+
+        if not sender or not sdp:
+            return
+
+        pc = self.peer_connections.get(sender)
+        if not pc:
+            logger.debug("Received answer for unknown or closed peer connection: %s", sender)
+            return
+
+        try:
+            remote_desc = RTCSessionDescription(sdp=sdp, type=type_name)
+            await pc.setRemoteDescription(remote_desc)
+
+            # Drain buffered ICE candidates
+            if sender in self.pending_ice_candidates:
+                for cand in self.pending_ice_candidates[sender]:
+                    try:
+                        await pc.addIceCandidate(cand)
+                    except Exception as e:
+                        logger.debug("Error applying early candidate after answer: %s", e)
+                del self.pending_ice_candidates[sender]
+
+        except Exception as e:
+            self.safe_print(f"[-] Failed to set remote answer from '{sender}': {e}")
+            await self._async_cleanup_peer(sender)
+
+    async def _handle_incoming_webrtc_ice(self, msg: Dict[str, Any]) -> None:
+        """Handle trickle ICE candidate from signaling server."""
+        sender = msg.get("sender")
+        cand_data = msg.get("candidate")
+        if not sender or not cand_data:
+            return
+
+        try:
+            if isinstance(cand_data, dict):
+                cand_str = cand_data.get("candidate", "")
+                sdp_mid = str(cand_data.get("sdpMid", "0"))
+                sdp_mline_index = int(cand_data.get("sdpMLineIndex", 0))
+            elif isinstance(cand_data, str):
+                cand_str = cand_data
+                sdp_mid = "0"
+                sdp_mline_index = 0
+            else:
+                return
+
+            if not cand_str:
+                return
+
+            candidate_obj = candidate_from_sdp(cand_str)
+            candidate_obj.sdpMid = sdp_mid
+            candidate_obj.sdpMLineIndex = sdp_mline_index
+
+            pc = self.peer_connections.get(sender)
+            if pc and pc.remoteDescription is not None:
+                await pc.addIceCandidate(candidate_obj)
+            else:
+                # Buffer candidate until remote description is set
+                self.pending_ice_candidates.setdefault(sender, []).append(candidate_obj)
+
+        except Exception as e:
+            logger.debug("Could not parse or add ICE candidate from '%s': %s", sender, e)
+
+    async def _send_local_ice_candidates(self, pc: RTCPeerConnection, target_user: str) -> None:
+        """Extract gathered ICE candidates from local SDP and trickle them via signaling."""
+        if not pc.localDescription or not pc.localDescription.sdp:
+            return
+
+        for line in pc.localDescription.sdp.split("\r\n"):
+            if line.startswith("a=candidate:"):
+                cand_str = line[2:]  # Remove 'a='
+                try:
+                    c = candidate_from_sdp(cand_str)
+                    c.sdpMid = "0"
+                    c.sdpMLineIndex = 0
+                    await self._send_signaling(
+                        {
+                            "type": ACTION_WEBRTC_ICE,
+                            "target_user": target_user,
+                            "candidate": {
+                                "candidate": candidate_to_sdp(c),
+                                "sdpMid": c.sdpMid,
+                                "sdpMLineIndex": c.sdpMLineIndex,
+                            },
+                        }
+                    )
+                except Exception as e:
+                    logger.debug("Error serializing candidate: %s", e)
+
+    def _setup_pc_events(self, pc: RTCPeerConnection, peer_user: str) -> None:
+        """Monitor WebRTC peer connection and ICE state changes."""
+
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            state = pc.connectionState
+            logger.info("WebRTC connection state with '%s' changed to: %s", peer_user, state)
+            if state == "failed":
+                self.connection_errors[peer_user] = "WebRTC peer connection failed."
+                if peer_user in self.channel_ready_events:
+                    self.channel_ready_events[peer_user].set()
+                self.safe_print(
+                    f"\n[-] Direct WebRTC connection to '{peer_user}' failed.\n"
+                    f"    (Direct UDP connectivity could not be established without relay.)"
+                )
+                await self._async_cleanup_peer(peer_user)
+            elif state == "closed":
+                await self._async_cleanup_peer(peer_user)
+
+        @pc.on("iceconnectionstatechange")
+        async def on_iceconnectionstatechange():
+            state = pc.iceConnectionState
+            logger.debug("ICE state with '%s': %s", peer_user, state)
+            if state == "failed":
+                self.connection_errors[peer_user] = "ICE connectivity checks failed."
+                if peer_user in self.channel_ready_events:
+                    self.channel_ready_events[peer_user].set()
+                self.safe_print(
+                    f"\n[-] Direct WebRTC ICE check with '{peer_user}' failed (no direct UDP path)."
+                )
+                await self._async_cleanup_peer(peer_user)
+
+    def _setup_datachannel(self, channel: RTCDataChannel, peer_user: str) -> None:
+        """Register event callbacks for the WebRTC chat DataChannel."""
+
+        def handle_open():
+            logger.info("DataChannel with '%s' is OPEN", peer_user)
+            with self.peers_lock:
+                self.active_peers[peer_user] = {
+                    "channel": channel,
+                    "pc": self.peer_connections.get(peer_user),
+                    "connected_at": time.time(),
+                }
+                if not self.active_chat_partner:
+                    self.active_chat_partner = peer_user
+
+            if peer_user in self.channel_ready_events:
+                self.channel_ready_events[peer_user].set()
+
+            self.safe_print(
+                f"\n[+] Direct WebRTC DataChannel established with '{peer_user}'! (Encrypted P2P)"
+            )
+
+        @channel.on("open")
+        def on_open():
+            handle_open()
+
+        if channel.readyState == "open":
+            handle_open()
+
+        @channel.on("message")
+        def on_message(raw_msg):
+            try:
+                if isinstance(raw_msg, bytes):
+                    raw_msg = raw_msg.decode("utf-8")
+                msg = json.loads(raw_msg)
+            except Exception as e:
+                logger.debug("Failed to decode DataChannel message from %s: %s", peer_user, e)
+                return
+
+            action = msg.get("type")
+            if action == ACTION_CHAT_MESSAGE:
+                sender = msg.get("from", peer_user)
+                text = msg.get("text", "")
+                ts = time.strftime("%H:%M:%S", time.localtime(msg.get("timestamp", time.time())))
+                self.safe_print(f"\n[{ts}] [{sender}]: {text}")
+
+            elif action == ACTION_PEER_DISCONNECT:
+                self.safe_print(f"\n[*] Peer '{peer_user}' closed the direct chat session.")
+                asyncio.run_coroutine_threadsafe(self._async_cleanup_peer(peer_user), self.loop)
+
+        @channel.on("close")
+        def on_close():
+            logger.info("DataChannel with '%s' closed", peer_user)
+            asyncio.run_coroutine_threadsafe(self._async_cleanup_peer(peer_user), self.loop)
+
+    async def _async_cleanup_peer(self, peer_user: str) -> None:
+        """Clean up all WebRTC resources associated with a specific peer."""
+        had_peer = False
+        with self.peers_lock:
+            if peer_user in self.active_peers:
+                del self.active_peers[peer_user]
+                had_peer = True
+            if self.active_chat_partner == peer_user:
                 self.active_chat_partner = next(iter(self.active_peers)) if self.active_peers else None
 
-        try:
-            peer_sock.close()
-        except Exception:
-            pass
+        channel = self.data_channels.pop(peer_user, None)
+        if channel:
+            try:
+                channel.close()
+            except Exception:
+                pass
 
-        if target_name:
-            self.safe_print(f"\n[!] Direct chat session with '{target_name}' disconnected.")
+        pc = self.peer_connections.pop(peer_user, None)
+        if pc:
+            try:
+                await pc.close()
+            except Exception:
+                pass
+
+        self.pending_ice_candidates.pop(peer_user, None)
+        self.channel_ready_events.pop(peer_user, None)
+
+        if had_peer:
+            self.safe_print(f"\n[!] Direct chat session with '{peer_user}' disconnected.")
 
     # -------------------------------------------------------------------------
-    # 4. Chat and CLI Actions
+    # Chat and CLI Actions
     # -------------------------------------------------------------------------
     def send_chat_message(self, target_user: str, text: str) -> bool:
-        """Send a direct message to a peer over the direct P2P socket."""
+        """Send a message to a peer over the direct WebRTC DataChannel."""
         if not text.strip():
+            return False
+
+        # Guard against oversized messages that exceed max payload limit
+        encoded_len = len(text.encode("utf-8"))
+        if encoded_len > MAX_MESSAGE_SIZE - 512:
+            self.safe_print(
+                f"[-] Message rejected: payload size ({encoded_len} bytes) exceeds maximum limit ({MAX_MESSAGE_SIZE - 512} bytes)."
+            )
             return False
 
         with self.peers_lock:
             peer_info = self.active_peers.get(target_user)
 
         if not peer_info:
-            # Not yet connected directly. Try establishing connection first
-            self.safe_print(f"[*] Not connected to '{target_user}'. Attempting direct connection...")
+            self.safe_print(f"[*] Not connected to '{target_user}'. Attempting direct WebRTC connection...")
             if not self.connect_to_peer(target_user):
                 return False
             with self.peers_lock:
@@ -447,7 +714,11 @@ class PeerClient:
             if not peer_info:
                 return False
 
-        peer_sock = peer_info["socket"]
+        channel: RTCDataChannel = peer_info["channel"]
+        if channel.readyState != "open":
+            self.safe_print(f"[-] DataChannel to '{target_user}' is not open (state: {channel.readyState}).")
+            return False
+
         payload = {
             "type": ACTION_CHAT_MESSAGE,
             "from": self.username,
@@ -457,40 +728,45 @@ class PeerClient:
         }
 
         try:
-            # Transmit directly to peer socket
-            send_msg(peer_sock, payload)
-            timestamp = time.strftime("%H:%M:%S")
-            self.safe_print(f"[{timestamp}] [You -> {target_user}]: {text}")
+            raw_payload = json.dumps(payload)
+            self.loop.call_soon_threadsafe(channel.send, raw_payload)
+            ts = time.strftime("%H:%M:%S")
+            self.safe_print(f"[{ts}] [You -> {target_user}]: {text}")
             return True
-        except (socket.error, OSError) as e:
+        except Exception as e:
             self.safe_print(f"[-] Failed to send message to '{target_user}': {e}")
-            self._cleanup_peer(peer_sock, target_user)
+            self.close_peer(target_user)
             return False
 
     def list_online_users(self) -> None:
-        """Request and print list of online users from the signaling server."""
+        """Request and print list of registered online users from the signaling server."""
         if not self.signaling_connected:
             self.safe_print("[-] Not connected to signaling server. Cannot retrieve online users.")
             return
 
-        req_event = threading.Event()
-        with self.req_lock:
-            self.pending_requests[ACTION_USER_LIST] = req_event
-            self.response_data.pop(ACTION_USER_LIST, None)
-
         try:
-            send_msg(self.signaling_sock, {"type": ACTION_LIST_USERS})
+            self._run_coro(self._async_list_online_users(), timeout=5.0)
         except Exception as e:
-            self.safe_print(f"[-] Failed to query signaling server: {e}")
+            self.safe_print(f"[-] Failed to retrieve user list: {e}")
+
+    async def _async_list_online_users(self) -> None:
+        """Async implementation to request user list from signaling server."""
+        req_event = asyncio.Event()
+        self.pending_requests[ACTION_USER_LIST] = req_event
+        self.response_data.pop(ACTION_USER_LIST, None)
+
+        sent = await self._send_signaling({"type": ACTION_LIST_USERS})
+        if not sent:
+            self.safe_print("[-] Failed to query signaling server.")
             return
 
-        if not req_event.wait(timeout=4.0):
+        try:
+            await asyncio.wait_for(req_event.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
             self.safe_print("[-] Timed out waiting for user list from signaling server.")
             return
 
-        with self.req_lock:
-            users = self.response_data.get(ACTION_USER_LIST, [])
-
+        users = self.response_data.get(ACTION_USER_LIST, [])
         self.safe_print("\n" + "=" * 45)
         self.safe_print("              ONLINE USERS")
         self.safe_print("=" * 45)
@@ -499,52 +775,54 @@ class PeerClient:
         else:
             for u in users:
                 uname = u.get("username")
-                uip = u.get("ip")
-                uport = u.get("port")
                 with self.peers_lock:
-                    connected_status = " [DIRECT P2P CONNECTED]" if uname in self.active_peers else ""
-                self.safe_print(f"  • {uname:<15} ({uip}:{uport}){connected_status}")
+                    connected_status = " [DIRECT WEBRTC CONNECTED]" if uname in self.active_peers else ""
+                self.safe_print(f"  • {uname:<15}{connected_status}")
         self.safe_print("=" * 45 + "\n")
 
     def show_status(self) -> None:
-        """Display detailed connection status."""
+        """Display detailed connection and WebRTC state."""
         sig_status = "CONNECTED" if self.signaling_connected else "DISCONNECTED"
-        self.safe_print("\n" + "=" * 45)
-        self.safe_print("           CONNECTION STATUS")
-        self.safe_print("=" * 45)
+        self.safe_print("\n" + "=" * 50)
+        self.safe_print("            CONNECTION STATUS")
+        self.safe_print("=" * 50)
         self.safe_print(f"  Username:            {self.username}")
-        self.safe_print(f"  Local LAN IP:        {self.advertised_ip}")
-        self.safe_print(f"  P2P Listen Port:     {self.listen_port}")
         self.safe_print(f"  Signaling Server:    {self.signaling_ip}:{self.signaling_port} ({sig_status})")
+        self.safe_print(f"  STUN Server:         {self.stun_server_url}")
         self.safe_print(f"  Active Chat Partner: {self.active_chat_partner or 'None'}")
 
         with self.peers_lock:
             peers = list(self.active_peers.items())
 
-        self.safe_print(f"  Direct P2P Sessions: {len(peers)}")
+        self.safe_print(f"  Direct WebRTC Peers: {len(peers)}")
         for uname, info in peers:
-            self.safe_print(f"    - {uname:<12} ({info['ip']}:{info['port']})")
-        self.safe_print("=" * 45 + "\n")
+            channel: RTCDataChannel = info["channel"]
+            pc: RTCPeerConnection = info["pc"]
+            pc_state = pc.connectionState if pc else "unknown"
+            ice_state = pc.iceConnectionState if pc else "unknown"
+            dc_state = channel.readyState if channel else "unknown"
+            self.safe_print(f"    - {uname:<12} (PC: {pc_state}, ICE: {ice_state}, Channel: {dc_state})")
+        self.safe_print("=" * 50 + "\n")
 
     def show_help(self) -> None:
         """Display available CLI commands."""
         help_text = """
 Commands:
   /users                 - List online users registered on signaling server
-  /chat <username>       - Connect directly to peer and set as active chat partner
+  /chat <username>       - Establish direct WebRTC P2P DataChannel to peer
   /msg <username> <text> - Send a direct message to a specific peer
-  /status                - Display connection status and active P2P sessions
-  /close [username]      - Close direct chat session with a peer
+  /status                - Display WebRTC connection status and active peers
+  /close [username]      - Close direct WebRTC chat session with a peer
   /help                  - Show this help message
   /exit                  - Disconnect all sessions and exit
 
 Tip: Once connected to a peer via /chat <username>, any text entered without
-a leading '/' command is sent directly to your active chat partner.
+a leading '/' command is sent directly to your active chat partner over WebRTC.
 """
         self.safe_print(help_text)
 
     def close_peer(self, target_user: Optional[str]) -> None:
-        """Close direct connection with a peer."""
+        """Close direct WebRTC connection with a peer."""
         target = target_user or self.active_chat_partner
         if not target:
             self.safe_print("[-] No peer specified and no active chat partner.")
@@ -557,40 +835,60 @@ a leading '/' command is sent directly to your active chat partner.
             self.safe_print(f"[-] Not directly connected to '{target}'.")
             return
 
-        sock = peer_info["socket"]
-        try:
-            send_msg(sock, {"type": ACTION_PEER_DISCONNECT})
-        except Exception:
-            pass
-        self._cleanup_peer(sock, target)
-        self.safe_print(f"[+] Closed direct connection with '{target}'.")
-
-    def disconnect_all(self) -> None:
-        """Cleanly close all peer sockets and signaling socket."""
-        self.is_running = False
-
-        # Close all peer connections
-        with self.peers_lock:
-            for uname, info in list(self.active_peers.items()):
-                try:
-                    send_msg(info["socket"], {"type": ACTION_PEER_DISCONNECT})
-                    info["socket"].close()
-                except Exception:
-                    pass
-            self.active_peers.clear()
-            self.sock_to_peer.clear()
-
-        # Close peer listener
-        if self.listener_sock:
+        channel = peer_info.get("channel")
+        if channel and channel.readyState == "open":
             try:
-                self.listener_sock.close()
+                disconnect_payload = json.dumps({"type": ACTION_PEER_DISCONNECT})
+                self.loop.call_soon_threadsafe(channel.send, disconnect_payload)
             except Exception:
                 pass
 
-        # Close signaling connection
-        if self.signaling_sock:
+        try:
+            self._run_coro(self._async_cleanup_peer(target), timeout=3.0)
+        except Exception:
+            pass
+
+        self.safe_print(f"[+] Closed direct WebRTC connection with '{target}'.")
+
+    def disconnect_all(self) -> None:
+        """Cleanly close all WebRTC peer connections, signaling socket, and loop."""
+        self.is_running = False
+
+        try:
+            self._run_coro(self._async_disconnect_all(), timeout=4.0)
+        except Exception:
+            pass
+
+        # Stop asyncio event loop
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.loop_thread.join(timeout=2.0)
+        if not self.loop.is_closed():
             try:
-                self.signaling_sock.close()
+                self.loop.close()
+            except Exception:
+                pass
+
+    async def _async_disconnect_all(self) -> None:
+        """Async cleanup of all peer connections and signaling sockets."""
+        peer_names = list(self.peer_connections.keys())
+        for peer in peer_names:
+            await self._async_cleanup_peer(peer)
+
+        if self.signaling_task and not self.signaling_task.done():
+            self.signaling_task.cancel()
+
+        # Cancel and wait on any remaining background tasks
+        for task in list(self.background_tasks):
+            if not task.done():
+                task.cancel()
+        if self.background_tasks:
+            await asyncio.gather(*list(self.background_tasks), return_exceptions=True)
+
+        if self.signaling_writer:
+            try:
+                self.signaling_writer.close()
+                await self.signaling_writer.wait_closed()
             except Exception:
                 pass
             self.signaling_connected = False
@@ -604,9 +902,9 @@ def run_cli():
     config = AppConfig()
     config.configure_logging("p2p_chat.client")
 
-    print("=" * 45)
-    print("       PYTHON P2P CLI CHAT")
-    print("=" * 45)
+    print("=" * 55)
+    print("       PYTHON P2P CLI CHAT (WebRTC DataChannel)")
+    print("=" * 55)
 
     # 1. Username resolution: CLI argument > environment variable > interactive prompt
     username = ""
@@ -626,76 +924,48 @@ def run_cli():
             print("\nExiting.")
             sys.exit(0)
 
-    # 2. Server IP resolution: CLI argument > environment variable > interactive prompt
+    # 2. Server host/IP resolution: CLI argument > environment variable > interactive prompt
     server_ip = config.signaling_server_ip
     if len(sys.argv) > 2:
         try:
-            validate_ip(sys.argv[2], "Signaling Server IP", allow_all_interfaces=False)
-            server_ip = sys.argv[2].strip()
+            server_ip = validate_host(sys.argv[2], "Signaling Server Host")
         except ValueError as e:
-            print(f"Warning: {e}. Falling back to configured IP: {server_ip}")
+            print(f"Warning: {e}. Falling back to configured host: {server_ip}")
     elif "SIGNALING_SERVER_IP" not in os.environ:
         try:
-            prompt_str = f"Enter server LAN IP [{server_ip}]: "
+            prompt_str = f"Enter signaling server host/IP [{server_ip}]: "
             val = input(prompt_str).strip()
             if val:
                 try:
-                    validate_ip(val, "Signaling Server IP", allow_all_interfaces=False)
-                    server_ip = val
+                    server_ip = validate_host(val, "Signaling Server Host")
                 except ValueError as e:
                     print(f"Warning: {e}. Using {server_ip}")
         except (KeyboardInterrupt, EOFError):
             print("\nExiting.")
             sys.exit(0)
 
-    # 3. P2P Listen Port resolution: CLI argument > environment variable > interactive prompt
+    # 3. Optional listen port (retained for command compatibility)
     listen_port = config.client_listen_port
     if len(sys.argv) > 3:
         try:
-            listen_port = validate_port(sys.argv[3], "P2P Listen Port")
+            listen_port = validate_port(sys.argv[3], "Client Port")
         except ValueError as e:
             print(f"Warning: {e}. Using {listen_port}")
-    elif "CLIENT_LISTEN_PORT" not in os.environ:
-        try:
-            port_input = input(f"Enter P2P listen port [{listen_port}]: ").strip()
-            if port_input:
-                try:
-                    listen_port = validate_port(port_input, "P2P Listen Port")
-                except ValueError as e:
-                    print(f"Warning: {e}. Using {listen_port}")
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting.")
-            sys.exit(0)
 
-    # Try binding listener port; if occupied, allow user to increment
-    client = None
-    bind_attempts = 0
-    cur_port = listen_port
-
-    while bind_attempts < 5:
-        try:
-            client = PeerClient(
-                username=username,
-                signaling_ip=server_ip,
-                signaling_port=config.server_port,
-                listen_host=config.client_listen_host,
-                listen_port=cur_port,
-            )
-            client.start_peer_listener()
-            break
-        except OSError:
-            bind_attempts += 1
-            cur_port += 1
-            print(f"[-] Port {cur_port - 1} is already in use. Trying port {cur_port}...")
-
-    if not client or not client.is_running:
-        print(f"[-] Could not bind listening socket. Please configure an available port.")
-        sys.exit(1)
+    client = PeerClient(
+        username=username,
+        signaling_ip=server_ip,
+        signaling_port=config.server_port,
+        listen_host=config.client_listen_host,
+        listen_port=listen_port,
+        stun_server_url=config.stun_server_url,
+    )
+    client.start_peer_listener()
 
     # Connect to signaling server
     if not client.connect_to_signaling_server():
         print("[-] Could not connect to signaling server.")
-        print("[*] Note: You can still listen for direct incoming connections, but discovery is disabled.")
+        print("[*] Note: Discovery is disabled until signaling server is reached.")
     else:
         print("[+] Discovery service connected. Discovering online peers...")
         client.list_online_users()
@@ -754,7 +1024,7 @@ def run_cli():
                     print(f"[-] Unknown command '{cmd}'. Type /help for available commands.")
 
             else:
-                # Text entered directly without a slash command
+                # Direct message to active partner
                 if client.active_chat_partner:
                     client.send_chat_message(client.active_chat_partner, line)
                 else:

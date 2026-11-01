@@ -8,6 +8,7 @@ indicating JSON payload length) to prevent fragmentation or concatenation issues
 import json
 import struct
 import socket
+import asyncio
 import logging
 from typing import Dict, Any, Optional
 
@@ -32,7 +33,12 @@ ACTION_USER_DISCONNECTED = "user_disconnected"
 ACTION_HEARTBEAT = "heartbeat"
 ACTION_HEARTBEAT_ACK = "heartbeat_ack"
 
-# Direct Peer-to-Peer Action Types
+# WebRTC Signaling Action Types (routed through signaling server)
+ACTION_WEBRTC_OFFER = "webrtc_offer"
+ACTION_WEBRTC_ANSWER = "webrtc_answer"
+ACTION_WEBRTC_ICE = "webrtc_ice"
+
+# Direct Peer-to-Peer Action Types (WebRTC DataChannel / legacy P2P)
 ACTION_PEER_HANDSHAKE = "peer_handshake"
 ACTION_PEER_HANDSHAKE_ACK = "peer_handshake_ack"
 ACTION_CHAT_MESSAGE = "chat_message"
@@ -44,6 +50,9 @@ ALLOWED_SIGNALING_ACTIONS = {
     ACTION_LIST_USERS,
     ACTION_CONNECT_REQ,
     ACTION_HEARTBEAT,
+    ACTION_WEBRTC_OFFER,
+    ACTION_WEBRTC_ANSWER,
+    ACTION_WEBRTC_ICE,
 }
 
 
@@ -113,3 +122,47 @@ def recv_msg(sock: socket.socket) -> Optional[Dict[str, Any]]:
         return data
     except Exception as e:
         raise ValueError(f"Malformed JSON received: {e}") from e
+
+
+async def async_send_msg(writer: asyncio.StreamWriter, data: Dict[str, Any]) -> None:
+    """
+    Serialize data dictionary to JSON, prefix with a 4-byte length header,
+    and transmit over an asyncio StreamWriter.
+    """
+    raw_payload = json.dumps(data).encode("utf-8")
+    payload_len = len(raw_payload)
+    if payload_len > MAX_MESSAGE_SIZE:
+        raise ValueError(f"Payload size ({payload_len} bytes) exceeds maximum limit ({MAX_MESSAGE_SIZE} bytes)")
+
+    header = HEADER_STRUCT.pack(payload_len)
+    writer.write(header + raw_payload)
+    await writer.drain()
+
+
+async def async_recv_msg(reader: asyncio.StreamReader) -> Optional[Dict[str, Any]]:
+    """
+    Receive a length-prefixed JSON message from an asyncio StreamReader.
+    Returns the parsed dictionary, or None if EOF is reached.
+    """
+    try:
+        header_data = await reader.readexactly(HEADER_SIZE)
+    except (asyncio.IncompleteReadError, ConnectionResetError, ConnectionAbortedError, OSError):
+        return None
+
+    (payload_len,) = HEADER_STRUCT.unpack(header_data)
+    if payload_len > MAX_MESSAGE_SIZE:
+        raise ValueError(f"Message length {payload_len} exceeds maximum allowed size ({MAX_MESSAGE_SIZE} bytes)")
+
+    try:
+        body_data = await reader.readexactly(payload_len)
+    except (asyncio.IncompleteReadError, ConnectionResetError, ConnectionAbortedError, OSError):
+        return None
+
+    try:
+        data = json.loads(body_data.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Parsed JSON payload is not an object/dictionary")
+        return data
+    except Exception as e:
+        raise ValueError(f"Malformed JSON received: {e}") from e
+

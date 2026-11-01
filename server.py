@@ -29,6 +29,10 @@ from protocol import (
     ACTION_USER_DISCONNECTED,
     ACTION_HEARTBEAT,
     ACTION_HEARTBEAT_ACK,
+    ACTION_WEBRTC_OFFER,
+    ACTION_WEBRTC_ANSWER,
+    ACTION_WEBRTC_ICE,
+    ACTION_CHAT_MESSAGE,
     ALLOWED_SIGNALING_ACTIONS,
 )
 
@@ -55,7 +59,7 @@ class SignalingServer:
         self.clients: Dict[str, Dict[str, Any]] = {}
         # socket -> username
         self.sock_to_username: Dict[socket.socket, str] = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
     def start(self) -> None:
         """Bind server socket and begin listening for client connections."""
@@ -108,6 +112,27 @@ class SignalingServer:
                 # Occurs when socket is closed during shutdown
                 break
 
+    def _safe_send_msg(self, sock: socket.socket, data: Dict[str, Any], lock: Optional[threading.Lock] = None) -> bool:
+        """Thread-safe socket transmission to prevent interleaved TCP framing."""
+        if not lock:
+            with self.lock:
+                username = self.sock_to_username.get(sock)
+                if username and username in self.clients:
+                    lock = self.clients[username].get("send_lock")
+        if lock:
+            with lock:
+                try:
+                    send_msg(sock, data)
+                    return True
+                except Exception:
+                    return False
+        else:
+            try:
+                send_msg(sock, data)
+                return True
+            except Exception:
+                return False
+
     def _handle_client(self, client_sock: socket.socket, client_addr: tuple) -> None:
         """Handle signaling requests from a single client connection."""
         client_ip = client_addr[0]
@@ -122,18 +147,34 @@ class SignalingServer:
 
                 action = msg.get("type")
 
-                # STRICT SECURITY CHECK: Reject chat messages or unauthorized action types
-                if action not in ALLOWED_SIGNALING_ACTIONS:
+                # STRICT SECURITY CHECK: Reject chat messages from traversing the signaling server
+                if action == ACTION_CHAT_MESSAGE:
                     logger.warning(
-                        "Client %s attempted invalid or forbidden action: %s",
+                        "Client %s attempted forbidden chat relay action: %s",
                         registered_user or client_ip,
                         action,
                     )
-                    send_msg(
+                    self._safe_send_msg(
                         client_sock,
                         {
                             "type": ACTION_CONNECT_ERROR,
                             "error": "Forbidden: Signaling server handles discovery only. Chat messages must be direct P2P.",
+                        },
+                    )
+                    continue
+
+                # Reject unknown or unauthorized actions
+                if not action or action not in ALLOWED_SIGNALING_ACTIONS:
+                    logger.warning(
+                        "Client %s attempted invalid or unknown action: %s",
+                        registered_user or client_ip,
+                        action,
+                    )
+                    self._safe_send_msg(
+                        client_sock,
+                        {
+                            "type": ACTION_CONNECT_ERROR,
+                            "error": f"Invalid action: '{action}' is not supported.",
                         },
                     )
                     continue
@@ -144,8 +185,10 @@ class SignalingServer:
                     self._handle_list_users(client_sock, registered_user)
                 elif action == ACTION_CONNECT_REQ:
                     self._handle_connect_req(client_sock, registered_user, msg)
+                elif action in (ACTION_WEBRTC_OFFER, ACTION_WEBRTC_ANSWER, ACTION_WEBRTC_ICE):
+                    self._handle_webrtc_signaling(client_sock, registered_user, msg, action)
                 elif action == ACTION_HEARTBEAT:
-                    send_msg(client_sock, {"type": ACTION_HEARTBEAT_ACK, "timestamp": time.time()})
+                    self._safe_send_msg(client_sock, {"type": ACTION_HEARTBEAT_ACK, "timestamp": time.time()})
 
         except (ConnectionResetError, ConnectionAbortedError) as e:
             logger.debug("Client connection reset: %s (%s)", registered_user or client_ip, e)
@@ -155,12 +198,12 @@ class SignalingServer:
             self._cleanup_client(client_sock, registered_user)
 
     def _handle_register(self, client_sock: socket.socket, client_ip: str, msg: Dict[str, Any]) -> Optional[str]:
-        """Handle client registration with unique username and listening port."""
+        """Handle client registration with unique username and optional listening port."""
         username = str(msg.get("username", "")).strip()
         listen_port = msg.get("listen_port")
 
         if not USERNAME_REGEX.match(username):
-            send_msg(
+            self._safe_send_msg(
                 client_sock,
                 {
                     "type": ACTION_REGISTER_ERROR,
@@ -169,48 +212,63 @@ class SignalingServer:
             )
             return None
 
-        try:
-            listen_port = int(listen_port)
-            if not (1024 <= listen_port <= 65535):
-                raise ValueError()
-        except (TypeError, ValueError):
-            send_msg(
-                client_sock,
-                {
-                    "type": ACTION_REGISTER_ERROR,
-                    "error": "Invalid listen_port. Must be an integer between 1024 and 65535.",
-                },
-            )
-            return None
+        if listen_port is not None:
+            try:
+                listen_port = int(listen_port)
+                if not (1024 <= listen_port <= 65535) and listen_port != 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                self._safe_send_msg(
+                    client_sock,
+                    {
+                        "type": ACTION_REGISTER_ERROR,
+                        "error": "Invalid listen_port. Must be an integer between 1024 and 65535.",
+                    },
+                )
+                return None
+        else:
+            listen_port = 0
 
         # Allow client to suggest its own LAN IP if it knows it, but default to the socket's peer IP
-        # If client connects via 127.0.0.1 (local machine testing), respect client's advertised IP if provided
         advertised_ip = msg.get("advertised_ip")
         effective_ip = client_ip
         if client_ip in ("127.0.0.1", "::1") and advertised_ip and advertised_ip != "0.0.0.0":
             effective_ip = advertised_ip
 
+        is_error = False
+        err_msg = ""
         with self.lock:
-            if username in self.clients:
-                send_msg(
-                    client_sock,
-                    {
-                        "type": ACTION_REGISTER_ERROR,
-                        "error": f"Username '{username}' is already in use by another user.",
-                    },
-                )
-                return None
+            # Reject re-registration on an already-registered socket connection
+            existing_user = self.sock_to_username.get(client_sock)
+            if existing_user:
+                is_error = True
+                err_msg = f"Connection already registered as '{existing_user}'."
+            elif username in self.clients:
+                is_error = True
+                err_msg = f"Username '{username}' is already in use by another user."
+            else:
+                send_lock = threading.Lock()
+                self.clients[username] = {
+                    "ip": effective_ip,
+                    "listen_port": listen_port,
+                    "socket": client_sock,
+                    "send_lock": send_lock,
+                    "connected_at": time.time(),
+                }
+                self.sock_to_username[client_sock] = username
 
-            self.clients[username] = {
-                "ip": effective_ip,
-                "listen_port": listen_port,
-                "socket": client_sock,
-                "connected_at": time.time(),
-            }
-            self.sock_to_username[client_sock] = username
+        if is_error:
+            self._safe_send_msg(
+                client_sock,
+                {
+                    "type": ACTION_REGISTER_ERROR,
+                    "error": err_msg,
+                },
+            )
+            return existing_user if existing_user else None
 
         logger.info("Registered user '%s' from %s (P2P listen port: %d)", username, effective_ip, listen_port)
-        send_msg(
+        self._safe_send_msg(
             client_sock,
             {
                 "type": ACTION_REGISTER_ACK,
@@ -218,6 +276,7 @@ class SignalingServer:
                 "registered_ip": effective_ip,
                 "listen_port": listen_port,
             },
+            lock=send_lock,
         )
         return username
 
@@ -234,25 +293,31 @@ class SignalingServer:
                 if uname != requester
             ]
 
-        send_msg(client_sock, {"type": ACTION_USER_LIST, "users": user_list})
+        self._safe_send_msg(client_sock, {"type": ACTION_USER_LIST, "users": user_list})
 
     def _handle_connect_req(self, client_sock: socket.socket, requester: Optional[str], msg: Dict[str, Any]) -> None:
         """Handle request to obtain target peer's IP and listening port for direct connection."""
         if not requester:
-            send_msg(
+            self._safe_send_msg(
                 client_sock,
                 {"type": ACTION_CONNECT_ERROR, "error": "Must be registered to request connection."},
             )
             return
 
         target_user = str(msg.get("target_user", "")).strip()
+        if not USERNAME_REGEX.match(target_user):
+            self._safe_send_msg(
+                client_sock,
+                {"type": ACTION_CONNECT_ERROR, "error": f"Invalid target_user format: '{target_user}'."},
+            )
+            return
 
         with self.lock:
             target_info = self.clients.get(target_user)
             requester_info = self.clients.get(requester)
 
         if not target_info:
-            send_msg(
+            self._safe_send_msg(
                 client_sock,
                 {
                     "type": ACTION_CONNECT_ERROR,
@@ -263,7 +328,7 @@ class SignalingServer:
             return
 
         # Send peer connection metadata back to requester
-        send_msg(
+        self._safe_send_msg(
             client_sock,
             {
                 "type": ACTION_PEER_INFO,
@@ -276,20 +341,126 @@ class SignalingServer:
         # Notify target peer that requester is attempting to connect
         if requester_info:
             target_sock = target_info.get("socket")
+            target_lock = target_info.get("send_lock")
             if target_sock:
-                try:
-                    send_msg(
-                        target_sock,
-                        {
-                            "type": ACTION_PEER_INFO,
-                            "peer_user": requester,
-                            "peer_ip": requester_info["ip"],
-                            "peer_port": requester_info["listen_port"],
-                            "direction": "incoming_notice",
-                        },
-                    )
-                except Exception as e:
-                    logger.debug("Could not send incoming notice to %s: %s", target_user, e)
+                self._safe_send_msg(
+                    target_sock,
+                    {
+                        "type": ACTION_PEER_INFO,
+                        "peer_user": requester,
+                        "peer_ip": requester_info["ip"],
+                        "peer_port": requester_info["listen_port"],
+                        "direction": "incoming_notice",
+                    },
+                    lock=target_lock,
+                )
+
+    def _handle_webrtc_signaling(
+        self,
+        client_sock: socket.socket,
+        registered_user: Optional[str],
+        msg: Dict[str, Any],
+        action_type: str,
+    ) -> None:
+        """Route WebRTC signaling message (offer, answer, or candidate) to the target recipient."""
+        if not registered_user:
+            self._safe_send_msg(
+                client_sock,
+                {"type": ACTION_CONNECT_ERROR, "error": "Must be registered to send WebRTC signaling messages."},
+            )
+            return
+
+        target_user = str(msg.get("target_user", "")).strip()
+        if not target_user:
+            self._safe_send_msg(
+                client_sock,
+                {"type": ACTION_CONNECT_ERROR, "error": "Missing target_user for WebRTC signaling."},
+            )
+            return
+
+        if not USERNAME_REGEX.match(target_user):
+            self._safe_send_msg(
+                client_sock,
+                {"type": ACTION_CONNECT_ERROR, "error": f"Invalid target_user format: '{target_user}'."},
+            )
+            return
+
+        if target_user == registered_user:
+            self._safe_send_msg(
+                client_sock,
+                {"type": ACTION_CONNECT_ERROR, "error": "Cannot signal oneself."},
+            )
+            return
+
+        # Validate WebRTC payloads to prevent sending malformed signaling to peers
+        if action_type in (ACTION_WEBRTC_OFFER, ACTION_WEBRTC_ANSWER):
+            sdp = msg.get("sdp")
+            type_name = msg.get("type_name")
+            if not sdp or not isinstance(sdp, str) or not sdp.strip():
+                self._safe_send_msg(
+                    client_sock,
+                    {"type": ACTION_CONNECT_ERROR, "target_user": target_user, "error": f"Missing or invalid SDP in {action_type}."},
+                )
+                return
+            if not type_name or not isinstance(type_name, str):
+                self._safe_send_msg(
+                    client_sock,
+                    {"type": ACTION_CONNECT_ERROR, "target_user": target_user, "error": f"Missing or invalid type_name in {action_type}."},
+                )
+                return
+        elif action_type == ACTION_WEBRTC_ICE:
+            candidate = msg.get("candidate")
+            if not candidate or not isinstance(candidate, (dict, str)):
+                self._safe_send_msg(
+                    client_sock,
+                    {"type": ACTION_CONNECT_ERROR, "target_user": target_user, "error": "Missing or invalid candidate in webrtc_ice."},
+                )
+                return
+
+        with self.lock:
+            target_info = self.clients.get(target_user)
+
+        if not target_info:
+            self._safe_send_msg(
+                client_sock,
+                {
+                    "type": ACTION_CONNECT_ERROR,
+                    "target_user": target_user,
+                    "error": f"User '{target_user}' is not online or not registered.",
+                },
+            )
+            return
+
+        target_sock = target_info.get("socket")
+        target_lock = target_info.get("send_lock")
+        if not target_sock:
+            return
+
+        # Stamp the verified sender to prevent impersonation
+        forwarded_payload = {
+            "type": action_type,
+            "sender": registered_user,
+        }
+        if "sdp" in msg:
+            forwarded_payload["sdp"] = msg["sdp"]
+        if "type_name" in msg:
+            forwarded_payload["type_name"] = msg["type_name"]
+        if "candidate" in msg:
+            forwarded_payload["candidate"] = msg["candidate"]
+
+        success = self._safe_send_msg(target_sock, forwarded_payload, lock=target_lock)
+        if success:
+            logger.debug("Routed %s from '%s' to '%s'", action_type, registered_user, target_user)
+        else:
+            logger.error("Failed to route %s from '%s' to '%s'", action_type, registered_user, target_user)
+            self._safe_send_msg(
+                client_sock,
+                {
+                    "type": ACTION_CONNECT_ERROR,
+                    "target_user": target_user,
+                    "error": f"Failed to deliver signaling message to '{target_user}'.",
+                },
+            )
 
     def _cleanup_client(self, client_sock: socket.socket, username: Optional[str]) -> None:
         """Remove client from registry, notify remaining peers, and close socket."""
@@ -303,7 +474,7 @@ class SignalingServer:
             if client_sock in self.sock_to_username:
                 del self.sock_to_username[client_sock]
 
-            remaining_socks = [info["socket"] for info in self.clients.values()]
+            remaining = [(info["socket"], info.get("send_lock")) for info in self.clients.values()]
 
         try:
             client_sock.close()
@@ -317,11 +488,8 @@ class SignalingServer:
                 "type": ACTION_USER_DISCONNECTED,
                 "username": disconnected_user,
             }
-            for s in remaining_socks:
-                try:
-                    send_msg(s, disconnect_msg)
-                except Exception:
-                    pass
+            for s, slock in remaining:
+                self._safe_send_msg(s, disconnect_msg, lock=slock)
 
     def stop(self) -> None:
         """Gracefully stop server and close all active sockets."""

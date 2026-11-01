@@ -1,15 +1,6 @@
-# Python Peer-to-Peer CLI Chat Application
-# Built entirely with the Python Standard Library (Python 3.8+)
-# No external third-party dependencies are required to run the server or client.
-#
-# Standard library modules utilized:
-# - socket (TCP networking and LAN communications)
-# - threading (Concurrent client and peer socket management)
-# - json (Message payload encoding and decoding)
-# - struct (Binary length-prefixed TCP message framing)
-# - os, sys (Environment variables, arguments, and CLI interaction)
-# - logging (Configurable logging and error diagnostics)
-# - unittest (Automated test suite)
-#
+# Python Peer-to-Peer CLI Chat Application (cli-chat)
+# WebRTC Peer-to-Peer DataChannels via aiortc
+aiortc>=1.15.0
+
 # Optional test runners / utilities:
-# pytest>=7.0.0
+pytest>=7.0.0

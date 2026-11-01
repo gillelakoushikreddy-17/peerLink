@@ -9,7 +9,7 @@ import os
 import socket
 import logging
 import ipaddress
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger("p2p_chat.config")
 
@@ -117,6 +117,49 @@ def validate_ip(ip: str, name: str = "IP Address", allow_all_interfaces: bool = 
 
 
 
+def validate_host(host: str, name: str = "Host") -> str:
+    """
+    Validate that a host string is a valid IPv4 address, IPv6 address, or hostname/FQDN.
+    """
+    host = host.strip()
+    if not host:
+        raise ValueError(f"{name} cannot be empty")
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    if len(host) > 253:
+        raise ValueError(f"{name} is too long: {host}")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._")
+    if not set(host).issubset(allowed):
+        raise ValueError(f"Invalid characters in {name}: {host}")
+    return host
+
+
+def validate_stun_urls(raw_urls: Optional[str], default: str = "stun:stun.l.google.com:19302") -> List[str]:
+    """
+    Parse and validate comma-separated STUN server URLs.
+    Ensures every URL starts with 'stun:' or 'stuns:'.
+    """
+    target = (raw_urls or "").strip()
+    if not target:
+        target = default
+
+    parsed_urls = []
+    for item in target.split(","):
+        url = item.strip()
+        if not url:
+            continue
+        if not (url.startswith("stun:") or url.startswith("stuns:")):
+            raise ValueError(f"Invalid STUN URL '{url}'. Must begin with 'stun:' or 'stuns:'.")
+        parsed_urls.append(url)
+
+    if not parsed_urls:
+        raise ValueError("At least one valid STUN URL must be configured.")
+    return parsed_urls
+
+
 class AppConfig:
     """Application configuration holder with environment loading and validation."""
 
@@ -134,9 +177,16 @@ class AppConfig:
         self.server_port = validate_port(os.getenv("SERVER_PORT", "5000"), "SERVER_PORT")
 
         # Client connection configuration
-        # For client: signaling server IP address to connect to
-        self.signaling_server_ip = os.getenv("SIGNALING_SERVER_IP", "127.0.0.1").strip()
-        # Client P2P listen host and port
+        # For client: signaling server IP or hostname to connect to
+        raw_sig_ip = os.getenv("SIGNALING_SERVER_IP", "127.0.0.1").strip()
+        self.signaling_server_ip = validate_host(raw_sig_ip, "SIGNALING_SERVER_IP")
+
+        # WebRTC STUN Server configuration (used for ICE candidate discovery across NAT)
+        raw_stun = os.getenv("STUN_SERVER_URL", "stun:stun.l.google.com:19302")
+        self.stun_server_urls = validate_stun_urls(raw_stun)
+        self.stun_server_url = self.stun_server_urls[0] if self.stun_server_urls else "stun:stun.l.google.com:19302"
+
+        # Client P2P listen host and port (retained for backward compatibility / local binding)
         self.client_listen_host = validate_ip(
             os.getenv("CLIENT_LISTEN_HOST", "0.0.0.0"), "CLIENT_LISTEN_HOST", allow_all_interfaces=True
         )
