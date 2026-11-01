@@ -84,7 +84,7 @@ class SignalingServer:
 
         lan_ip = get_lan_ip()
         print("=" * 60)
-        print("      P2P CHAT SIGNALING SERVER (DISCOVERY ONLY)")
+        print("   PEERLINK — P2P SIGNALING SERVER (DISCOVERY ONLY)")
         print("=" * 60)
         print(f"[*] Bound on:         {self.host}:{self.port}")
         print(f"[*] Local LAN IP:     {lan_ip}")

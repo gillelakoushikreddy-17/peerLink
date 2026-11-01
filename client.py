@@ -156,7 +156,7 @@ class PeerClient:
             sys.stdout.write(f"\r\033[K{message}{end}")
             if self.is_running:
                 prompt_partner = f" [{self.active_chat_partner}]" if self.active_chat_partner else ""
-                sys.stdout.write(f"CLI{prompt_partner} > ")
+                sys.stdout.write(f"PeerLink{prompt_partner} > ")
             sys.stdout.flush()
 
     def start_peer_listener(self) -> None:
@@ -903,7 +903,7 @@ def run_cli():
     config.configure_logging("p2p_chat.client")
 
     print("=" * 55)
-    print("       PYTHON P2P CLI CHAT (WebRTC DataChannel)")
+    print("      PEERLINK — P2P CLI CHAT (WebRTC DataChannel)")
     print("=" * 55)
 
     # 1. Username resolution: CLI argument > environment variable > interactive prompt
@@ -996,7 +996,7 @@ def run_cli():
         while client.is_running:
             partner_tag = f" [{client.active_chat_partner}]" if client.active_chat_partner else ""
             try:
-                line = input(f"CLI{partner_tag} > ").strip()
+                line = input(f"PeerLink{partner_tag} > ").strip()
             except EOFError:
                 break
 

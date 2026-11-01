@@ -1,4 +1,4 @@
-# cli-chat — Internet-Enabled Peer-to-Peer CLI Chat (WebRTC)
+# PeerLink — Internet-Enabled Peer-to-Peer CLI Chat (WebRTC)
 
 A terminal-based command-line peer-to-peer (P2P) chat application in Python that enables users across local networks and the internet to communicate directly using **WebRTC DataChannels** (`aiortc`), backed by a lightweight discovery and signaling server.
 
@@ -6,7 +6,7 @@ A terminal-based command-line peer-to-peer (P2P) chat application in Python that
 
 ## 1. Project Overview
 
-`cli-chat` provides real-time, terminal-based messaging directly between two peers. Rather than routing personal conversations through an intermediary chat server, `cli-chat` utilizes **WebRTC DataChannels** for end-to-end direct peer-to-peer transport over UDP, encrypted with **DTLS (Datagram Transport Layer Security)**.
+**PeerLink** provides real-time, terminal-based messaging directly between two peers. Rather than routing personal conversations through an intermediary chat server, PeerLink utilizes **WebRTC DataChannels** for end-to-end direct peer-to-peer transport over UDP, encrypted with **DTLS (Datagram Transport Layer Security)**.
 
 A central **Signaling Server** coordinates peer registration and session negotiation (exchanging SDP offers, answers, and ICE candidates). Once the WebRTC peer connection is established, all chat messages flow directly between peers.
 

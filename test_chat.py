@@ -1,5 +1,5 @@
 """
-test_chat.py - Comprehensive Automated Test Suite for WebRTC P2P CLI Chat Application.
+test_chat.py - Comprehensive Automated Test Suite for PeerLink (WebRTC P2P CLI Chat).
 
 Verifies:
 1. Configuration loading, environment overrides, IP/port validation, and host/domain validation.
